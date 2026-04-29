@@ -10,6 +10,8 @@ const ETAM_VIEWS = [
   { suffix: "d", folder: "dwfb8de729" }
 ];
 
+const DOWNLOAD_TIMEOUT_MS = 7000;
+
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -83,9 +85,23 @@ function detectExtension(contentType = "") {
   return "jpg";
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function downloadImage(url) {
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "GET",
       redirect: "follow",
       headers: {
@@ -95,19 +111,19 @@ async function downloadImage(url) {
     });
 
     if (!response.ok) {
-      return { ok: false };
+      return { ok: false, reason: `http_${response.status}` };
     }
 
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.toLowerCase().startsWith("image/")) {
-      return { ok: false };
+      return { ok: false, reason: "not_image" };
     }
 
     const arrayBuffer = await response.arrayBuffer();
     const bytes = new Uint8Array(arrayBuffer);
 
     if (!bytes.length) {
-      return { ok: false };
+      return { ok: false, reason: "empty" };
     }
 
     return {
@@ -116,8 +132,8 @@ async function downloadImage(url) {
       mimeType: contentType,
       ext: detectExtension(contentType)
     };
-  } catch {
-    return { ok: false };
+  } catch (error) {
+    return { ok: false, reason: "timeout_or_fetch_error" };
   }
 }
 
@@ -167,115 +183,116 @@ function buildZipName() {
   return `etam-${YYYY}${MM}${DD}-${hh}${mm}.zip`;
 }
 
-export default {
-  async fetch(request) {
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: corsHeaders()
-      });
-    }
-
-    if (request.method !== "POST") {
-      return jsonResponse({ error: "Método no permitido." }, 405);
-    }
-
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return jsonResponse({ error: "JSON inválido." }, 400);
-    }
-
-    const rows = Array.isArray(body?.rows) ? body.rows : null;
-    if (!rows) {
-      return jsonResponse({ error: "Debes enviar rows." }, 400);
-    }
-
-    const zip = new JSZip();
-    const rowResults = [];
-    const errors = [];
-    let totalFiles = 0;
-
-    for (const row of rows) {
-      const rowNumber = Number(row?.rowNumber || 0);
-      const inputCode = String(row?.modelCode || "").trim();
-      const skuFalabella = String(row?.skuFalabella || "").trim();
-
-      const rowResult = {
-        rowNumber,
-        inputCode,
-        skuFalabella,
-        downloadedFiles: [],
-        ok: false
-      };
-
-      if (!inputCode || !skuFalabella) {
-        errors.push(`Fila ${rowNumber}: faltan datos.`);
-        rowResults.push(rowResult);
-        continue;
-      }
-
-      const parsed = parseEtamCode(inputCode);
-      if (!parsed) {
-        errors.push(`Fila ${rowNumber}: código inválido "${inputCode}".`);
-        rowResults.push(rowResult);
-        continue;
-      }
-
-      const entries = getCandidateEntries(parsed);
-      const found = [];
-
-      for (const entry of entries) {
-        const result = await downloadImage(entry.url);
-        if (!result.ok) continue;
-
-        found.push({
-          foundCode: entry.displayCode,
-          sourceView: entry.sourceView,
-          bytes: result.bytes,
-          ext: result.ext
-        });
-      }
-
-      if (!found.length) {
-        errors.push(`Fila ${rowNumber}: no se encontraron vistas para "${inputCode}".`);
-        rowResults.push(rowResult);
-        continue;
-      }
-
-      found.forEach((item, index) => {
-        const finalView = index + 1;
-        const fileName = `${skuFalabella}_${finalView}.${item.ext}`;
-        zip.file(fileName, item.bytes);
-        rowResult.downloadedFiles.push(fileName);
-        totalFiles += 1;
-      });
-
-      rowResult.ok = rowResult.downloadedFiles.length > 0;
-      rowResults.push(rowResult);
-    }
-
-    if (!totalFiles) {
-      return jsonResponse({
-        error: "No se pudo descargar ninguna imagen.",
-        errors,
-        rowResults
-      }, 400);
-    }
-
-    zip.file("manifest.txt", buildManifestText(rowResults));
-
-    const zipBytes = await zip.generateAsync({ type: "uint8array" });
-    const zipName = buildZipName();
-
-    return new Response(zipBytes, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/zip",
-        "Content-Disposition": `attachment; filename="${zipName}"`,
-        ...corsHeaders()
-      }
+export default async function handler(request) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders()
     });
   }
-};
+
+  if (request.method !== "POST") {
+    return jsonResponse({ error: "Método no permitido." }, 405);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: "JSON inválido." }, 400);
+  }
+
+  const rows = Array.isArray(body?.rows) ? body.rows : null;
+  if (!rows) {
+    return jsonResponse({ error: "Debes enviar rows." }, 400);
+  }
+
+  const zip = new JSZip();
+  const rowResults = [];
+  const errors = [];
+  let totalFiles = 0;
+
+  for (const row of rows) {
+    const rowNumber = Number(row?.rowNumber || 0);
+    const inputCode = String(row?.modelCode || "").trim();
+    const skuFalabella = String(row?.skuFalabella || "").trim();
+
+    const rowResult = {
+      rowNumber,
+      inputCode,
+      skuFalabella,
+      downloadedFiles: [],
+      ok: false
+    };
+
+    if (!inputCode || !skuFalabella) {
+      errors.push(`Fila ${rowNumber}: faltan datos.`);
+      rowResults.push(rowResult);
+      continue;
+    }
+
+    const parsed = parseEtamCode(inputCode);
+    if (!parsed) {
+      errors.push(`Fila ${rowNumber}: código inválido "${inputCode}".`);
+      rowResults.push(rowResult);
+      continue;
+    }
+
+    const entries = getCandidateEntries(parsed);
+    const found = [];
+
+    for (const entry of entries) {
+      const result = await downloadImage(entry.url);
+
+      if (!result.ok) {
+        continue;
+      }
+
+      found.push({
+        foundCode: entry.displayCode,
+        sourceView: entry.sourceView,
+        bytes: result.bytes,
+        ext: result.ext
+      });
+    }
+
+    if (!found.length) {
+      errors.push(`Fila ${rowNumber}: no se encontraron vistas para "${inputCode}".`);
+      rowResults.push(rowResult);
+      continue;
+    }
+
+    found.forEach((item, index) => {
+      const finalView = index + 1;
+      const fileName = `${skuFalabella}_${finalView}.${item.ext}`;
+      zip.file(fileName, item.bytes);
+      rowResult.downloadedFiles.push(fileName);
+      totalFiles += 1;
+    });
+
+    rowResult.ok = rowResult.downloadedFiles.length > 0;
+    rowResults.push(rowResult);
+  }
+
+  if (!totalFiles) {
+    return jsonResponse({
+      error: "No se pudo descargar ninguna imagen.",
+      errors,
+      rowResults
+    }, 400);
+  }
+
+  zip.file("manifest.txt", buildManifestText(rowResults));
+
+  const zipBytes = await zip.generateAsync({ type: "uint8array" });
+  const zipName = buildZipName();
+
+  return new Response(zipBytes, {
+    status: 200,
+    headers: {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${zipName}"`,
+      ...corsHeaders()
+    }
+  });
+}
