@@ -435,7 +435,7 @@ async function downloadImage(url) {
       buffer,
       ext: detectExtension(contentType)
     };
-  } catch (error) {
+  } catch (_) {
     return { ok: false, reason: "timeout_or_fetch_error" };
   }
 }
@@ -605,14 +605,6 @@ module.exports = async function handler(req, res) {
 
       rowResult.ok = rowResult.downloadedFiles.length > 0;
       rowResults.push(rowResult);
-    }
-
-    if (!totalFiles) {
-      return res.status(400).json({
-        error: "No se pudo descargar ninguna imagen.",
-        errors,
-        rowResults
-      });
     }
 
     zip.file("manifest.txt", buildManifestText(rowResults));
