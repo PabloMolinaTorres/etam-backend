@@ -1,4 +1,4 @@
-import JSZip from "jszip";
+const JSZip = require("jszip");
 
 const ETAM_VIEWS = [
   { suffix: "x", folder: "dwecc25dfe" },
@@ -12,22 +12,10 @@ const ETAM_VIEWS = [
 
 const DOWNLOAD_TIMEOUT_MS = 7000;
 
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
-  };
-}
-
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders()
-    }
-  });
+function setCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
 function buildEtamUrl(model, suffix, folder) {
@@ -120,16 +108,15 @@ async function downloadImage(url) {
     }
 
     const arrayBuffer = await response.arrayBuffer();
-    const bytes = new Uint8Array(arrayBuffer);
+    const buffer = Buffer.from(arrayBuffer);
 
-    if (!bytes.length) {
+    if (!buffer.length) {
       return { ok: false, reason: "empty" };
     }
 
     return {
       ok: true,
-      bytes,
-      mimeType: contentType,
+      buffer,
       ext: detectExtension(contentType)
     };
   } catch (error) {
@@ -183,116 +170,112 @@ function buildZipName() {
   return `etam-${YYYY}${MM}${DD}-${hh}${mm}.zip`;
 }
 
-export default async function handler(request) {
-  if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: corsHeaders()
-    });
+module.exports = async function handler(req, res) {
+  setCors(res);
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
   }
 
-  if (request.method !== "POST") {
-    return jsonResponse({ error: "Método no permitido." }, 405);
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Método no permitido." });
   }
 
-  let body;
   try {
-    body = await request.json();
-  } catch {
-    return jsonResponse({ error: "JSON inválido." }, 400);
-  }
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : null;
 
-  const rows = Array.isArray(body?.rows) ? body.rows : null;
-  if (!rows) {
-    return jsonResponse({ error: "Debes enviar rows." }, 400);
-  }
-
-  const zip = new JSZip();
-  const rowResults = [];
-  const errors = [];
-  let totalFiles = 0;
-
-  for (const row of rows) {
-    const rowNumber = Number(row?.rowNumber || 0);
-    const inputCode = String(row?.modelCode || "").trim();
-    const skuFalabella = String(row?.skuFalabella || "").trim();
-
-    const rowResult = {
-      rowNumber,
-      inputCode,
-      skuFalabella,
-      downloadedFiles: [],
-      ok: false
-    };
-
-    if (!inputCode || !skuFalabella) {
-      errors.push(`Fila ${rowNumber}: faltan datos.`);
-      rowResults.push(rowResult);
-      continue;
+    if (!rows) {
+      return res.status(400).json({ error: "Debes enviar rows." });
     }
 
-    const parsed = parseEtamCode(inputCode);
-    if (!parsed) {
-      errors.push(`Fila ${rowNumber}: código inválido "${inputCode}".`);
-      rowResults.push(rowResult);
-      continue;
-    }
+    const zip = new JSZip();
+    const rowResults = [];
+    const errors = [];
+    let totalFiles = 0;
 
-    const entries = getCandidateEntries(parsed);
-    const found = [];
+    for (const row of rows) {
+      const rowNumber = Number(row?.rowNumber || 0);
+      const inputCode = String(row?.modelCode || "").trim();
+      const skuFalabella = String(row?.skuFalabella || "").trim();
 
-    for (const entry of entries) {
-      const result = await downloadImage(entry.url);
+      const rowResult = {
+        rowNumber,
+        inputCode,
+        skuFalabella,
+        downloadedFiles: [],
+        ok: false
+      };
 
-      if (!result.ok) {
+      if (!inputCode || !skuFalabella) {
+        errors.push(`Fila ${rowNumber}: faltan datos.`);
+        rowResults.push(rowResult);
         continue;
       }
 
-      found.push({
-        foundCode: entry.displayCode,
-        sourceView: entry.sourceView,
-        bytes: result.bytes,
-        ext: result.ext
+      const parsed = parseEtamCode(inputCode);
+      if (!parsed) {
+        errors.push(`Fila ${rowNumber}: código inválido "${inputCode}".`);
+        rowResults.push(rowResult);
+        continue;
+      }
+
+      const entries = getCandidateEntries(parsed);
+      const found = [];
+
+      for (const entry of entries) {
+        const result = await downloadImage(entry.url);
+
+        if (!result.ok) {
+          continue;
+        }
+
+        found.push({
+          foundCode: entry.displayCode,
+          sourceView: entry.sourceView,
+          buffer: result.buffer,
+          ext: result.ext
+        });
+      }
+
+      if (!found.length) {
+        errors.push(`Fila ${rowNumber}: no se encontraron vistas para "${inputCode}".`);
+        rowResults.push(rowResult);
+        continue;
+      }
+
+      found.forEach((item, index) => {
+        const finalView = index + 1;
+        const fileName = `${skuFalabella}_${finalView}.${item.ext}`;
+        zip.file(fileName, item.buffer);
+        rowResult.downloadedFiles.push(fileName);
+        totalFiles += 1;
+      });
+
+      rowResult.ok = rowResult.downloadedFiles.length > 0;
+      rowResults.push(rowResult);
+    }
+
+    if (!totalFiles) {
+      return res.status(400).json({
+        error: "No se pudo descargar ninguna imagen.",
+        errors,
+        rowResults
       });
     }
 
-    if (!found.length) {
-      errors.push(`Fila ${rowNumber}: no se encontraron vistas para "${inputCode}".`);
-      rowResults.push(rowResult);
-      continue;
-    }
+    zip.file("manifest.txt", buildManifestText(rowResults));
 
-    found.forEach((item, index) => {
-      const finalView = index + 1;
-      const fileName = `${skuFalabella}_${finalView}.${item.ext}`;
-      zip.file(fileName, item.bytes);
-      rowResult.downloadedFiles.push(fileName);
-      totalFiles += 1;
+    const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+    const zipName = buildZipName();
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+    return res.status(200).send(zipBuffer);
+
+  } catch (error) {
+    console.error("ETAM backend error:", error);
+    return res.status(500).json({
+      error: "Error interno procesando ETAM."
     });
-
-    rowResult.ok = rowResult.downloadedFiles.length > 0;
-    rowResults.push(rowResult);
   }
-
-  if (!totalFiles) {
-    return jsonResponse({
-      error: "No se pudo descargar ninguna imagen.",
-      errors,
-      rowResults
-    }, 400);
-  }
-
-  zip.file("manifest.txt", buildManifestText(rowResults));
-
-  const zipBytes = await zip.generateAsync({ type: "uint8array" });
-  const zipName = buildZipName();
-
-  return new Response(zipBytes, {
-    status: 200,
-    headers: {
-      "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename="${zipName}"`,
-      ...corsHeaders()
-    }
-  });
-}
+};
