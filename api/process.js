@@ -203,8 +203,8 @@ function buildBrownieSearchQueries(parsed) {
   const normalized = normalizeBrownieRef(raw);
 
   return uniqPreserveOrder([
-    raw,
     hyphenVariant,
+    raw,
     normalized
   ].filter(Boolean));
 }
@@ -229,6 +229,26 @@ function extractBrownieProductUrlsFromSearchHtml(html) {
   return uniqPreserveOrder(
     urls.map(url => decodeBrownieEscapedText(url).split("?")[0])
   );
+}
+
+function extractBrownieProductUrlsFromSuggestJson(data) {
+  const urls = [];
+  const products = data?.resources?.results?.products;
+
+  if (Array.isArray(products)) {
+    for (const product of products) {
+      const url = product?.url || product?.handle;
+      if (!url) continue;
+
+      if (String(url).startsWith("http")) {
+        urls.push(String(url).split("?")[0]);
+      } else if (String(url).startsWith("/")) {
+        urls.push(`https://www.browniespain.com${String(url).split("?")[0]}`);
+      }
+    }
+  }
+
+  return uniqPreserveOrder(urls);
 }
 
 function detectExtension(contentType = "") {
@@ -268,6 +288,23 @@ async function fetchText(url, timeoutMs = 15000) {
   }
 
   return await response.text();
+}
+
+async function fetchJson(url, timeoutMs = 15000) {
+  const response = await fetchWithTimeout(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "application/json,text/plain,*/*"
+    }
+  }, timeoutMs);
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  return await response.json();
 }
 
 async function loadBrownieFeedEntries(forceRefresh = false) {
@@ -320,6 +357,18 @@ async function searchBrownieProductUrls(query) {
   const foundUrls = [];
 
   for (const locale of BROWNIE_LOCALES) {
+    const suggestUrl = brownieLocaleUrl(
+      locale,
+      `/search/suggest.json?q=${encodeURIComponent(query)}&resources[type]=product&resources[limit]=10`
+    );
+
+    try {
+      const data = await fetchJson(suggestUrl, 15000);
+      const suggestUrls = extractBrownieProductUrlsFromSuggestJson(data);
+      foundUrls.push(...suggestUrls);
+    } catch (_) {
+    }
+
     const searchUrl = brownieLocaleUrl(locale, `/search?q=${encodeURIComponent(query)}&type=product`);
 
     try {
@@ -351,11 +400,14 @@ async function fetchBrownieProductDetail(productUrl) {
 async function getBrownieCandidateEntries(parsed) {
   let matched = null;
 
+  const hyphenVariant = makeBrownieHyphenVariant(parsed.raw);
+
   try {
     const feedEntries = await loadBrownieFeedEntries(false);
     matched = feedEntries.find(entry =>
       entry.normalizedReference === parsed.normalized ||
-      entry.normalizedParent === parsed.normalized
+      entry.normalizedParent === parsed.normalized ||
+      entry.normalizedReference === normalizeBrownieRef(hyphenVariant)
     );
   } catch (_) {
   }
@@ -370,9 +422,11 @@ async function getBrownieCandidateEntries(parsed) {
         try {
           const detail = await fetchBrownieProductDetail(productUrl);
           const detailNorm = normalizeBrownieRef(detail.reference);
+          const hyphenNorm = normalizeBrownieRef(hyphenVariant);
 
           if (
             detailNorm === parsed.normalized ||
+            detailNorm === hyphenNorm ||
             detailNorm.includes(parsed.normalized) ||
             parsed.normalized.includes(detailNorm)
           ) {
