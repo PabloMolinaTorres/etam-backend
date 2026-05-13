@@ -15,9 +15,15 @@ const ETAM_VIEWS = [
 
 const BROWNIE_LOCALES = ["", "es-de", "es-pt", "en-be"];
 const BROWNIE_MAX_FEED_PAGES = 4;
+const BROWNIE_COLLECTION_PAGES = 4;
+const BROWNIE_DETAIL_CONCURRENCY = 6;
 
 let brownieFeedCache = null;
 let brownieSearchCache = new Map();
+let brownieCollectionUrlCache = null;
+let brownieProductUrlCache = null;
+let brownieProductDetailCache = new Map();
+let brownieRefToDetailCache = new Map();
 
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -53,6 +59,22 @@ function uniqPreserveOrder(arr) {
   }
 
   return out;
+}
+
+function pushDebugStep(debug, message) {
+  if (!debug) return;
+  debug.steps = debug.steps || [];
+  if (debug.steps.length < 120) {
+    debug.steps.push(message);
+  }
+}
+
+function pushDebugDownload(debug, message) {
+  if (!debug) return;
+  debug.downloads = debug.downloads || [];
+  if (debug.downloads.length < 40) {
+    debug.downloads.push(message);
+  }
 }
 
 function cleanBrownieImageUrl(url) {
@@ -251,6 +273,72 @@ function extractBrownieProductUrlsFromSuggestJson(data) {
   return uniqPreserveOrder(urls);
 }
 
+function extractBrownieCollectionUrlsFromHtml(html) {
+  const decoded = decodeBrownieEscapedText(html);
+  const urls = [];
+
+  const absoluteRegex = /https:\/\/www\.browniespain\.com\/(?:[a-z]{2}-[a-z]{2}\/)?collections\/[^"'?#<\s]+/gi;
+  const relativeRegex = /href="(\/(?:[a-z]{2}-[a-z]{2}\/)?collections\/[^"#?<\s]+)"/gi;
+
+  let match;
+
+  while ((match = absoluteRegex.exec(decoded)) !== null) {
+    urls.push(match[0]);
+  }
+
+  while ((match = relativeRegex.exec(decoded)) !== null) {
+    urls.push(`https://www.browniespain.com${match[1]}`);
+  }
+
+  return uniqPreserveOrder(
+    urls
+      .map(url => decodeBrownieEscapedText(url).split("?")[0])
+      .filter(url => !/\/products\//i.test(url))
+  );
+}
+
+function extractBrownieProductUrlsFromCollectionHtml(html) {
+  const decoded = decodeBrownieEscapedText(html);
+  const urls = [];
+
+  const absoluteRegex = /https:\/\/www\.browniespain\.com\/(?:[a-z]{2}-[a-z]{2}\/)?products\/[^"'?#<\s]+/gi;
+  const relativeRegex = /href="(\/(?:[a-z]{2}-[a-z]{2}\/)?products\/[^"#?<\s]+)"/gi;
+
+  let match;
+
+  while ((match = absoluteRegex.exec(decoded)) !== null) {
+    urls.push(match[0]);
+  }
+
+  while ((match = relativeRegex.exec(decoded)) !== null) {
+    urls.push(`https://www.browniespain.com${match[1]}`);
+  }
+
+  return uniqPreserveOrder(
+    urls.map(url => decodeBrownieEscapedText(url).split("?")[0])
+  );
+}
+
+function normalizeBrownieProductUrl(url) {
+  return String(url || "")
+    .replace(/\/(es-de|es-pt|en-be|es-es|en-es|fr-fr|fr|es|en)\//i, "/")
+    .replace(/\?.*$/, "")
+    .replace(/\/+$/, "");
+}
+
+function prioritizeBrownieCollectionUrls(urls) {
+  const preferred = [
+    "https://www.browniespain.com/collections/see-all",
+    "https://www.browniespain.com/collections/tshirts",
+    "https://www.browniespain.com/collections/accessories",
+    "https://www.browniespain.com/collections/bags",
+    "https://www.browniespain.com/collections/shoes"
+  ];
+
+  const merged = uniqPreserveOrder([...preferred, ...urls]);
+  return merged.map(normalizeBrownieProductUrl);
+}
+
 function detectExtension(contentType = "") {
   const type = String(contentType).toLowerCase();
   if (type.includes("image/avif")) return "avif";
@@ -348,10 +436,160 @@ async function loadBrownieFeedEntries(forceRefresh = false) {
   return brownieFeedCache;
 }
 
+async function loadBrownieCollectionUrls(forceRefresh = false) {
+  if (brownieCollectionUrlCache && !forceRefresh) {
+    return brownieCollectionUrlCache;
+  }
+
+  const found = [];
+
+  const sitemapTargets = [
+    "https://www.browniespain.com/pages/sitemap",
+    "https://www.browniespain.com/es-es/pages/sitemap",
+    "https://www.browniespain.com/en-es/pages/sitemap"
+  ];
+
+  for (const url of sitemapTargets) {
+    try {
+      const html = await fetchText(url, 15000);
+      const collectionUrls = extractBrownieCollectionUrlsFromHtml(html);
+      found.push(...collectionUrls);
+    } catch (_) {
+    }
+  }
+
+  brownieCollectionUrlCache = prioritizeBrownieCollectionUrls(found);
+  return brownieCollectionUrlCache;
+}
+
+async function loadBrownieProductUrlsFromCollections(forceRefresh = false, debug = null) {
+  if (brownieProductUrlCache && !forceRefresh) {
+    pushDebugStep(debug, `collection-product-cache:${brownieProductUrlCache.length}`);
+    return brownieProductUrlCache;
+  }
+
+  const collectionUrls = await loadBrownieCollectionUrls(forceRefresh);
+  const foundProductUrls = [];
+  const seenProducts = new Set();
+
+  pushDebugStep(debug, `collection-url-count:${collectionUrls.length}`);
+
+  for (const collectionUrl of collectionUrls) {
+    let emptyPages = 0;
+
+    for (let page = 1; page <= BROWNIE_COLLECTION_PAGES; page++) {
+      const pageUrl = page === 1 ? collectionUrl : `${collectionUrl}?page=${page}`;
+
+      try {
+        const html = await fetchText(pageUrl, 15000);
+        const pageProducts = extractBrownieProductUrlsFromCollectionHtml(html);
+
+        pushDebugStep(debug, `collection-page:${pageUrl}:products=${pageProducts.length}`);
+
+        let newCount = 0;
+        for (const productUrl of pageProducts) {
+          const normalizedUrl = normalizeBrownieProductUrl(productUrl);
+          if (seenProducts.has(normalizedUrl)) continue;
+          seenProducts.add(normalizedUrl);
+          foundProductUrls.push(normalizedUrl);
+          newCount += 1;
+        }
+
+        if (!pageProducts.length || newCount === 0) {
+          emptyPages += 1;
+        } else {
+          emptyPages = 0;
+        }
+
+        if (emptyPages >= 2) {
+          break;
+        }
+      } catch (error) {
+        pushDebugStep(debug, `collection-page-error:${pageUrl}:${error.message}`);
+        break;
+      }
+    }
+  }
+
+  brownieProductUrlCache = uniqPreserveOrder(foundProductUrls);
+  pushDebugStep(debug, `collection-product-total:${brownieProductUrlCache.length}`);
+  return brownieProductUrlCache;
+}
+
+async function fetchBrownieProductDetailCached(productUrl, debug = null) {
+  const normalizedUrl = normalizeBrownieProductUrl(productUrl);
+
+  if (brownieProductDetailCache.has(normalizedUrl)) {
+    pushDebugStep(debug, `pdp-cache-hit:${normalizedUrl}`);
+    return brownieProductDetailCache.get(normalizedUrl);
+  }
+
+  const detail = await fetchBrownieProductDetail(normalizedUrl, debug);
+  brownieProductDetailCache.set(normalizedUrl, detail);
+
+  if (detail?.normalizedReference) {
+    brownieRefToDetailCache.set(detail.normalizedReference, detail);
+  }
+
+  return detail;
+}
+
+async function findBrownieProductViaCollections(parsed, debug) {
+  const hyphenVariant = makeBrownieHyphenVariant(parsed.raw);
+  const hyphenNorm = normalizeBrownieRef(hyphenVariant);
+
+  if (brownieRefToDetailCache.has(parsed.normalized)) {
+    pushDebugStep(debug, `ref-cache-hit:${parsed.normalized}`);
+    return brownieRefToDetailCache.get(parsed.normalized);
+  }
+
+  if (brownieRefToDetailCache.has(hyphenNorm)) {
+    pushDebugStep(debug, `ref-cache-hit:${hyphenNorm}`);
+    return brownieRefToDetailCache.get(hyphenNorm);
+  }
+
+  const productUrls = await loadBrownieProductUrlsFromCollections(false, debug);
+
+  for (let i = 0; i < productUrls.length; i += BROWNIE_DETAIL_CONCURRENCY) {
+    const chunk = productUrls.slice(i, i + BROWNIE_DETAIL_CONCURRENCY);
+
+    const details = await Promise.all(
+      chunk.map(async (url) => {
+        try {
+          return await fetchBrownieProductDetailCached(url, debug);
+        } catch (error) {
+          pushDebugStep(debug, `collection-pdp-error:${url}:${error.message}`);
+          return null;
+        }
+      })
+    );
+
+    for (const detail of details) {
+      if (!detail) continue;
+
+      const detailNorm = normalizeBrownieRef(detail.reference);
+
+      if (
+        detailNorm === parsed.normalized ||
+        detailNorm === hyphenNorm ||
+        detailNorm.includes(parsed.normalized) ||
+        parsed.normalized.includes(detailNorm)
+      ) {
+        pushDebugStep(debug, `collection-pdp-match:${detail.reference || "no-ref"}:images=${detail.images?.length || 0}`);
+        return detail;
+      }
+    }
+
+    pushDebugStep(debug, `collection-scan-progress:${Math.min(i + BROWNIE_DETAIL_CONCURRENCY, productUrls.length)}/${productUrls.length}`);
+  }
+
+  return null;
+}
+
 async function searchBrownieProductUrls(query, debug) {
   const cacheKey = query.toUpperCase();
   if (brownieSearchCache.has(cacheKey)) {
-    if (debug) debug.steps.push(`search-cache-hit:${query}`);
+    pushDebugStep(debug, `search-cache-hit:${query}`);
     return brownieSearchCache.get(cacheKey);
   }
 
@@ -367,9 +605,9 @@ async function searchBrownieProductUrls(query, debug) {
       const data = await fetchJson(suggestUrl, 15000);
       const suggestUrls = extractBrownieProductUrlsFromSuggestJson(data);
       foundUrls.push(...suggestUrls);
-      if (debug) debug.steps.push(`suggest:${locale || "root"}:${query}:${suggestUrls.length}`);
+      pushDebugStep(debug, `suggest:${locale || "root"}:${query}:${suggestUrls.length}`);
     } catch (error) {
-      if (debug) debug.steps.push(`suggest-error:${locale || "root"}:${query}:${error.message}`);
+      pushDebugStep(debug, `suggest-error:${locale || "root"}:${query}:${error.message}`);
     }
 
     const searchUrl = brownieLocaleUrl(locale, `/search?q=${encodeURIComponent(query)}&type=product`);
@@ -378,9 +616,9 @@ async function searchBrownieProductUrls(query, debug) {
       const html = await fetchText(searchUrl, 15000);
       const urls = extractBrownieProductUrlsFromSearchHtml(html);
       foundUrls.push(...urls);
-      if (debug) debug.steps.push(`search-html:${locale || "root"}:${query}:${urls.length}`);
+      pushDebugStep(debug, `search-html:${locale || "root"}:${query}:${urls.length}`);
     } catch (error) {
-      if (debug) debug.steps.push(`search-html-error:${locale || "root"}:${query}:${error.message}`);
+      pushDebugStep(debug, `search-html-error:${locale || "root"}:${query}:${error.message}`);
     }
   }
 
@@ -388,7 +626,7 @@ async function searchBrownieProductUrls(query, debug) {
   brownieSearchCache.set(cacheKey, uniqueUrls);
 
   if (debug) {
-    debug.steps.push(`search-total:${query}:${uniqueUrls.length}`);
+    pushDebugStep(debug, `search-total:${query}:${uniqueUrls.length}`);
     if (uniqueUrls.length) {
       debug.sampleUrls = uniqueUrls.slice(0, 5);
     }
@@ -403,7 +641,7 @@ async function fetchBrownieProductDetail(productUrl, debug) {
   const images = extractBrownieImagesFromHtml(html);
 
   if (debug) {
-    debug.steps.push(`pdp:${productUrl}:ref=${reference || "none"}:images=${images.length}`);
+    pushDebugStep(debug, `pdp:${productUrl}:ref=${reference || "none"}:images=${images.length}`);
   }
 
   return {
@@ -443,25 +681,35 @@ async function getBrownieCandidateEntries(parsed, debug) {
   debug.queries = debug.queries || [];
   debug.sampleUrls = debug.sampleUrls || [];
 
-  try {
-    const feedEntries = await loadBrownieFeedEntries(false);
-    debug.feedCount = feedEntries.length;
+  if (brownieRefToDetailCache.has(parsed.normalized)) {
+    matched = brownieRefToDetailCache.get(parsed.normalized);
+    pushDebugStep(debug, `ref-cache-direct:${parsed.normalized}`);
+  } else if (brownieRefToDetailCache.has(hyphenNorm)) {
+    matched = brownieRefToDetailCache.get(hyphenNorm);
+    pushDebugStep(debug, `ref-cache-direct:${hyphenNorm}`);
+  }
 
-    matched = feedEntries.find(entry =>
-      entry.normalizedReference === parsed.normalized ||
-      entry.normalizedParent === parsed.normalized ||
-      entry.normalizedReference === hyphenNorm ||
-      entry.normalizedParent === hyphenNorm
-    );
+  if (!matched) {
+    try {
+      const feedEntries = await loadBrownieFeedEntries(false);
+      debug.feedCount = feedEntries.length;
 
-    if (matched) {
-      debug.feedMatch = matched.reference || matched.productUrl || "matched";
-      debug.steps.push(`feed-match:${matched.reference || "no-ref"}:images=${matched.images?.length || 0}`);
-    } else {
-      debug.steps.push(`feed-no-match:${parsed.raw}`);
+      matched = feedEntries.find(entry =>
+        entry.normalizedReference === parsed.normalized ||
+        entry.normalizedParent === parsed.normalized ||
+        entry.normalizedReference === hyphenNorm ||
+        entry.normalizedParent === hyphenNorm
+      );
+
+      if (matched) {
+        debug.feedMatch = matched.reference || matched.productUrl || "matched";
+        pushDebugStep(debug, `feed-match:${matched.reference || "no-ref"}:images=${matched.images?.length || 0}`);
+      } else {
+        pushDebugStep(debug, `feed-no-match:${parsed.raw}`);
+      }
+    } catch (error) {
+      pushDebugStep(debug, `feed-error:${error.message}`);
     }
-  } catch (error) {
-    debug.steps.push(`feed-error:${error.message}`);
   }
 
   if (!matched) {
@@ -473,7 +721,7 @@ async function getBrownieCandidateEntries(parsed, debug) {
 
       for (const productUrl of productUrls) {
         try {
-          const detail = await fetchBrownieProductDetail(productUrl, debug);
+          const detail = await fetchBrownieProductDetailCached(productUrl, debug);
           const detailNorm = normalizeBrownieRef(detail.reference);
 
           if (
@@ -488,17 +736,32 @@ async function getBrownieCandidateEntries(parsed, debug) {
               productUrl: detail.productUrl,
               images: detail.images || []
             };
-            debug.steps.push(`pdp-match:${detail.reference || "no-ref"}:images=${detail.images?.length || 0}`);
+            pushDebugStep(debug, `pdp-match:${detail.reference || "no-ref"}:images=${detail.images?.length || 0}`);
             break;
           } else {
-            debug.steps.push(`pdp-no-match:${detail.reference || "no-ref"}`);
+            pushDebugStep(debug, `pdp-no-match:${detail.reference || "no-ref"}`);
           }
         } catch (error) {
-          debug.steps.push(`pdp-error:${productUrl}:${error.message}`);
+          pushDebugStep(debug, `pdp-error:${productUrl}:${error.message}`);
         }
       }
 
       if (matched) break;
+    }
+  }
+
+  if (!matched) {
+    const collectionDetail = await findBrownieProductViaCollections(parsed, debug);
+    if (collectionDetail) {
+      const detailNorm = normalizeBrownieRef(collectionDetail.reference);
+      matched = {
+        reference: collectionDetail.reference || parsed.raw,
+        normalizedReference: detailNorm || parsed.normalized,
+        productUrl: collectionDetail.productUrl,
+        images: collectionDetail.images || []
+      };
+    } else {
+      pushDebugStep(debug, `collection-no-match:${parsed.raw}`);
     }
   }
 
@@ -680,7 +943,7 @@ module.exports = async function handler(req, res) {
         }
       } catch (error) {
         if (brand === "brownie") {
-          brownieDebug.steps.push(`entries-error:${error.message}`);
+          pushDebugStep(brownieDebug, `entries-error:${error.message}`);
         }
         entries = [];
       }
@@ -703,7 +966,7 @@ module.exports = async function handler(req, res) {
         const result = await downloadImage(entry.url);
 
         if (brand === "brownie") {
-          brownieDebug.downloads.push(`${entry.url}=>${result.ok ? "ok" : result.reason}`);
+          pushDebugDownload(brownieDebug, `${entry.url}=>${result.ok ? "ok" : result.reason}`);
         }
 
         if (!result.ok) continue;
