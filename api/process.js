@@ -1,3 +1,4 @@
+
 const JSZip = require("jszip");
 
 const ALLOWED_BRANDS = new Set(["etam", "brownie"]);
@@ -15,12 +16,21 @@ const ETAM_VIEWS = [
 
 const BROWNIE_LOCALES = ["", "es-de", "es-pt", "en-be"];
 const BROWNIE_MAX_FEED_PAGES = 4;
-const BROWNIE_COLLECTION_PAGES = 4;
-const BROWNIE_DETAIL_CONCURRENCY = 6;
+const BROWNIE_COLLECTION_TARGETS = [
+  { url: "https://www.browniespain.com/collections/see-all", pages: 4 },
+  { url: "https://www.browniespain.com/collections/novedades", pages: 2 },
+  { url: "https://www.browniespain.com/collections/tshirts", pages: 2 },
+  { url: "https://www.browniespain.com/collections/camisetas", pages: 2 },
+  { url: "https://www.browniespain.com/collections/bags", pages: 2 },
+  { url: "https://www.browniespain.com/collections/shoes", pages: 2 }
+];
+const BROWNIE_REQUEST_DELAY_MS = 500;
+const BROWNIE_429_BACKOFF_BASE_MS = 1800;
+const BROWNIE_MAX_429_RETRIES = 2;
+const BROWNIE_DETAIL_BATCH_SIZE = 2;
 
 let brownieFeedCache = null;
 let brownieSearchCache = new Map();
-let brownieCollectionUrlCache = null;
 let brownieProductUrlCache = null;
 let brownieProductDetailCache = new Map();
 let brownieRefToDetailCache = new Map();
@@ -64,7 +74,7 @@ function uniqPreserveOrder(arr) {
 function pushDebugStep(debug, message) {
   if (!debug) return;
   debug.steps = debug.steps || [];
-  if (debug.steps.length < 120) {
+  if (debug.steps.length < 160) {
     debug.steps.push(message);
   }
 }
@@ -273,30 +283,6 @@ function extractBrownieProductUrlsFromSuggestJson(data) {
   return uniqPreserveOrder(urls);
 }
 
-function extractBrownieCollectionUrlsFromHtml(html) {
-  const decoded = decodeBrownieEscapedText(html);
-  const urls = [];
-
-  const absoluteRegex = /https:\/\/www\.browniespain\.com\/(?:[a-z]{2}-[a-z]{2}\/)?collections\/[^"'?#<\s]+/gi;
-  const relativeRegex = /href="(\/(?:[a-z]{2}-[a-z]{2}\/)?collections\/[^"#?<\s]+)"/gi;
-
-  let match;
-
-  while ((match = absoluteRegex.exec(decoded)) !== null) {
-    urls.push(match[0]);
-  }
-
-  while ((match = relativeRegex.exec(decoded)) !== null) {
-    urls.push(`https://www.browniespain.com${match[1]}`);
-  }
-
-  return uniqPreserveOrder(
-    urls
-      .map(url => decodeBrownieEscapedText(url).split("?")[0])
-      .filter(url => !/\/products\//i.test(url))
-  );
-}
-
 function extractBrownieProductUrlsFromCollectionHtml(html) {
   const decoded = decodeBrownieEscapedText(html);
   const urls = [];
@@ -326,25 +312,16 @@ function normalizeBrownieProductUrl(url) {
     .replace(/\/+$/, "");
 }
 
-function prioritizeBrownieCollectionUrls(urls) {
-  const preferred = [
-    "https://www.browniespain.com/collections/see-all",
-    "https://www.browniespain.com/collections/tshirts",
-    "https://www.browniespain.com/collections/accessories",
-    "https://www.browniespain.com/collections/bags",
-    "https://www.browniespain.com/collections/shoes"
-  ];
-
-  const merged = uniqPreserveOrder([...preferred, ...urls]);
-  return merged.map(normalizeBrownieProductUrl);
-}
-
 function detectExtension(contentType = "") {
   const type = String(contentType).toLowerCase();
   if (type.includes("image/avif")) return "avif";
   if (type.includes("image/webp")) return "webp";
   if (type.includes("image/png")) return "png";
   return "jpg";
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
@@ -361,36 +338,50 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DOWNLOAD_TIMEOUT_
   }
 }
 
-async function fetchText(url, timeoutMs = 15000) {
-  const response = await fetchWithTimeout(url, {
+async function fetchResponseWithRetry(url, init, timeoutMs, retry429 = false, debug = null, label = "") {
+  let attempt = 0;
+
+  while (true) {
+    const response = await fetchWithTimeout(url, init, timeoutMs);
+
+    if (response.status === 429 && retry429 && attempt < BROWNIE_MAX_429_RETRIES) {
+      const waitMs = BROWNIE_429_BACKOFF_BASE_MS * (attempt + 1);
+      pushDebugStep(debug, `${label || "fetch"}:429:retry=${attempt + 1}:wait=${waitMs}`);
+      await sleep(waitMs);
+      attempt += 1;
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    return response;
+  }
+}
+
+async function fetchText(url, timeoutMs = 15000, retry429 = false, debug = null, label = "") {
+  const response = await fetchResponseWithRetry(url, {
     method: "GET",
     redirect: "follow",
     headers: {
       "User-Agent": "Mozilla/5.0",
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
-  }, timeoutMs);
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
+  }, timeoutMs, retry429, debug, label);
 
   return await response.text();
 }
 
-async function fetchJson(url, timeoutMs = 15000) {
-  const response = await fetchWithTimeout(url, {
+async function fetchJson(url, timeoutMs = 15000, retry429 = false, debug = null, label = "") {
+  const response = await fetchResponseWithRetry(url, {
     method: "GET",
     redirect: "follow",
     headers: {
       "User-Agent": "Mozilla/5.0",
       "Accept": "application/json,text/plain,*/*"
     }
-  }, timeoutMs);
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
+  }, timeoutMs, retry429, debug, label);
 
   return await response.json();
 }
@@ -436,54 +427,24 @@ async function loadBrownieFeedEntries(forceRefresh = false) {
   return brownieFeedCache;
 }
 
-async function loadBrownieCollectionUrls(forceRefresh = false) {
-  if (brownieCollectionUrlCache && !forceRefresh) {
-    return brownieCollectionUrlCache;
-  }
-
-  const found = [];
-
-  const sitemapTargets = [
-    "https://www.browniespain.com/pages/sitemap",
-    "https://www.browniespain.com/es-es/pages/sitemap",
-    "https://www.browniespain.com/en-es/pages/sitemap"
-  ];
-
-  for (const url of sitemapTargets) {
-    try {
-      const html = await fetchText(url, 15000);
-      const collectionUrls = extractBrownieCollectionUrlsFromHtml(html);
-      found.push(...collectionUrls);
-    } catch (_) {
-    }
-  }
-
-  brownieCollectionUrlCache = prioritizeBrownieCollectionUrls(found);
-  return brownieCollectionUrlCache;
-}
-
 async function loadBrownieProductUrlsFromCollections(forceRefresh = false, debug = null) {
   if (brownieProductUrlCache && !forceRefresh) {
     pushDebugStep(debug, `collection-product-cache:${brownieProductUrlCache.length}`);
     return brownieProductUrlCache;
   }
 
-  const collectionUrls = await loadBrownieCollectionUrls(forceRefresh);
   const foundProductUrls = [];
   const seenProducts = new Set();
 
-  pushDebugStep(debug, `collection-url-count:${collectionUrls.length}`);
+  pushDebugStep(debug, `collection-target-count:${BROWNIE_COLLECTION_TARGETS.length}`);
 
-  for (const collectionUrl of collectionUrls) {
-    let emptyPages = 0;
-
-    for (let page = 1; page <= BROWNIE_COLLECTION_PAGES; page++) {
-      const pageUrl = page === 1 ? collectionUrl : `${collectionUrl}?page=${page}`;
+  for (const target of BROWNIE_COLLECTION_TARGETS) {
+    for (let page = 1; page <= target.pages; page++) {
+      const pageUrl = page === 1 ? target.url : `${target.url}?page=${page}`;
 
       try {
-        const html = await fetchText(pageUrl, 15000);
+        const html = await fetchText(pageUrl, 15000, true, debug, `collection-page:${pageUrl}`);
         const pageProducts = extractBrownieProductUrlsFromCollectionHtml(html);
-
         pushDebugStep(debug, `collection-page:${pageUrl}:products=${pageProducts.length}`);
 
         let newCount = 0;
@@ -495,25 +456,81 @@ async function loadBrownieProductUrlsFromCollections(forceRefresh = false, debug
           newCount += 1;
         }
 
-        if (!pageProducts.length || newCount === 0) {
-          emptyPages += 1;
-        } else {
-          emptyPages = 0;
-        }
-
-        if (emptyPages >= 2) {
-          break;
-        }
+        pushDebugStep(debug, `collection-page-new:${pageUrl}:${newCount}`);
       } catch (error) {
         pushDebugStep(debug, `collection-page-error:${pageUrl}:${error.message}`);
         break;
       }
+
+      await sleep(BROWNIE_REQUEST_DELAY_MS);
     }
   }
 
   brownieProductUrlCache = uniqPreserveOrder(foundProductUrls);
   pushDebugStep(debug, `collection-product-total:${brownieProductUrlCache.length}`);
   return brownieProductUrlCache;
+}
+
+async function searchBrownieProductUrls(query, debug) {
+  const cacheKey = query.toUpperCase();
+  if (brownieSearchCache.has(cacheKey)) {
+    pushDebugStep(debug, `search-cache-hit:${query}`);
+    return brownieSearchCache.get(cacheKey);
+  }
+
+  const foundUrls = [];
+
+  for (const locale of BROWNIE_LOCALES) {
+    const suggestUrl = brownieLocaleUrl(
+      locale,
+      `/search/suggest.json?q=${encodeURIComponent(query)}&resources[type]=product&resources[limit]=10`
+    );
+
+    try {
+      const data = await fetchJson(suggestUrl, 15000, false, debug, `suggest:${locale || "root"}:${query}`);
+      const suggestUrls = extractBrownieProductUrlsFromSuggestJson(data);
+      foundUrls.push(...suggestUrls);
+      pushDebugStep(debug, `suggest:${locale || "root"}:${query}:${suggestUrls.length}`);
+    } catch (error) {
+      pushDebugStep(debug, `suggest-error:${locale || "root"}:${query}:${error.message}`);
+    }
+
+    const searchUrl = brownieLocaleUrl(locale, `/search?q=${encodeURIComponent(query)}&type=product`);
+
+    try {
+      const html = await fetchText(searchUrl, 15000, false, debug, `search-html:${locale || "root"}:${query}`);
+      const urls = extractBrownieProductUrlsFromSearchHtml(html);
+      foundUrls.push(...urls);
+      pushDebugStep(debug, `search-html:${locale || "root"}:${query}:${urls.length}`);
+    } catch (error) {
+      pushDebugStep(debug, `search-html-error:${locale || "root"}:${query}:${error.message}`);
+    }
+  }
+
+  const uniqueUrls = uniqPreserveOrder(foundUrls);
+  brownieSearchCache.set(cacheKey, uniqueUrls);
+
+  pushDebugStep(debug, `search-total:${query}:${uniqueUrls.length}`);
+  if (debug && uniqueUrls.length) {
+    debug.sampleUrls = uniqueUrls.slice(0, 5);
+  }
+
+  return uniqueUrls;
+}
+
+async function fetchBrownieProductDetail(productUrl, debug) {
+  const html = await fetchText(productUrl, 15000, true, debug, `pdp:${productUrl}`);
+  const reference = extractBrownieRefFromHtml(html);
+  const images = extractBrownieImagesFromHtml(html);
+
+  pushDebugStep(debug, `pdp:${productUrl}:ref=${reference || "none"}:images=${images.length}`);
+
+  return {
+    productUrl,
+    reference,
+    normalizedReference: normalizeBrownieRef(reference),
+    images
+  };
 }
 
 async function fetchBrownieProductDetailCached(productUrl, debug = null) {
@@ -550,19 +567,20 @@ async function findBrownieProductViaCollections(parsed, debug) {
 
   const productUrls = await loadBrownieProductUrlsFromCollections(false, debug);
 
-  for (let i = 0; i < productUrls.length; i += BROWNIE_DETAIL_CONCURRENCY) {
-    const chunk = productUrls.slice(i, i + BROWNIE_DETAIL_CONCURRENCY);
+  for (let i = 0; i < productUrls.length; i += BROWNIE_DETAIL_BATCH_SIZE) {
+    const chunk = productUrls.slice(i, i + BROWNIE_DETAIL_BATCH_SIZE);
+    const details = [];
 
-    const details = await Promise.all(
-      chunk.map(async (url) => {
-        try {
-          return await fetchBrownieProductDetailCached(url, debug);
-        } catch (error) {
-          pushDebugStep(debug, `collection-pdp-error:${url}:${error.message}`);
-          return null;
-        }
-      })
-    );
+    for (const url of chunk) {
+      try {
+        const detail = await fetchBrownieProductDetailCached(url, debug);
+        details.push(detail);
+      } catch (error) {
+        pushDebugStep(debug, `collection-pdp-error:${url}:${error.message}`);
+      }
+
+      await sleep(BROWNIE_REQUEST_DELAY_MS);
+    }
 
     for (const detail of details) {
       if (!detail) continue;
@@ -580,76 +598,10 @@ async function findBrownieProductViaCollections(parsed, debug) {
       }
     }
 
-    pushDebugStep(debug, `collection-scan-progress:${Math.min(i + BROWNIE_DETAIL_CONCURRENCY, productUrls.length)}/${productUrls.length}`);
+    pushDebugStep(debug, `collection-scan-progress:${Math.min(i + BROWNIE_DETAIL_BATCH_SIZE, productUrls.length)}/${productUrls.length}`);
   }
 
   return null;
-}
-
-async function searchBrownieProductUrls(query, debug) {
-  const cacheKey = query.toUpperCase();
-  if (brownieSearchCache.has(cacheKey)) {
-    pushDebugStep(debug, `search-cache-hit:${query}`);
-    return brownieSearchCache.get(cacheKey);
-  }
-
-  const foundUrls = [];
-
-  for (const locale of BROWNIE_LOCALES) {
-    const suggestUrl = brownieLocaleUrl(
-      locale,
-      `/search/suggest.json?q=${encodeURIComponent(query)}&resources[type]=product&resources[limit]=10`
-    );
-
-    try {
-      const data = await fetchJson(suggestUrl, 15000);
-      const suggestUrls = extractBrownieProductUrlsFromSuggestJson(data);
-      foundUrls.push(...suggestUrls);
-      pushDebugStep(debug, `suggest:${locale || "root"}:${query}:${suggestUrls.length}`);
-    } catch (error) {
-      pushDebugStep(debug, `suggest-error:${locale || "root"}:${query}:${error.message}`);
-    }
-
-    const searchUrl = brownieLocaleUrl(locale, `/search?q=${encodeURIComponent(query)}&type=product`);
-
-    try {
-      const html = await fetchText(searchUrl, 15000);
-      const urls = extractBrownieProductUrlsFromSearchHtml(html);
-      foundUrls.push(...urls);
-      pushDebugStep(debug, `search-html:${locale || "root"}:${query}:${urls.length}`);
-    } catch (error) {
-      pushDebugStep(debug, `search-html-error:${locale || "root"}:${query}:${error.message}`);
-    }
-  }
-
-  const uniqueUrls = uniqPreserveOrder(foundUrls);
-  brownieSearchCache.set(cacheKey, uniqueUrls);
-
-  if (debug) {
-    pushDebugStep(debug, `search-total:${query}:${uniqueUrls.length}`);
-    if (uniqueUrls.length) {
-      debug.sampleUrls = uniqueUrls.slice(0, 5);
-    }
-  }
-
-  return uniqueUrls;
-}
-
-async function fetchBrownieProductDetail(productUrl, debug) {
-  const html = await fetchText(productUrl, 15000);
-  const reference = extractBrownieRefFromHtml(html);
-  const images = extractBrownieImagesFromHtml(html);
-
-  if (debug) {
-    pushDebugStep(debug, `pdp:${productUrl}:ref=${reference || "none"}:images=${images.length}`);
-  }
-
-  return {
-    productUrl,
-    reference,
-    normalizedReference: normalizeBrownieRef(reference),
-    images
-  };
 }
 
 function buildBrownieDebugMessage(parsed, debug, phase) {
